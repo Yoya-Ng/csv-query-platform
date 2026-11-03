@@ -1,69 +1,134 @@
 # 基礎設施使用說明（PoC）
 
+PostgreSQL 不放在 Docker 內：自行安裝 PostgreSQL server（本機或其他主機），平台以 `.env` 中的連線字串連線。Docker 只跑 `app`（FastAPI）與 `proxy`（Caddy）。
+
 ## 檔案
 
 | 路徑 | 用途 |
 |---|---|
-| `docker/docker-compose.yml` | `app`、`proxy`（Caddy）；專案自帶 `db`（postgres:17）需啟用 `bundled-db` profile |
-| `docker/docker-compose.dev.yml` | 覆蓋檔：db 對應 `127.0.0.1:55432`（只綁本機），用於本機開發／測試 |
-| `docker/Dockerfile` | python:3.13-slim + uv，`uv sync --frozen --no-dev`，非 root 執行 |
+| `docker-compose.yml` | `app`、`proxy`（Caddy）；自動讀取同目錄的 `.env` |
+| `.env.example` | 連線設定範本（複製為 `.env`；`.env` 已被 .gitignore 與 .dockerignore 排除） |
+| `docker/Dockerfile` | 前端 `npm ci && npm run build`；後端 python:3.13-slim，`pip install --no-index --find-links` 離線安裝；非 root 執行 |
 | `docker/Caddyfile` | `tls internal`、寫入類路徑 IP allowlist、`header_up X-Forwarded-For {remote_host}` |
-| `docker/initdb/10-roles.sh` | 首次初始化建立 `cqp` 庫、`app_rw`、`app_ro` |
-| `env/mac.env.example`、`env/win.env.example` | 專案自帶 DB 的參數範本 |
-| `env/external.env.example` | 連接既有 PostgreSQL server 的範本（複製成 `env/external.env`；已被 .gitignore） |
-| `tools/make_local_env.py` | 由 mac 範本產生 `env/local.env`（隨機密碼，記憶體再調小） |
-| `tools/verify_db.py` | 驗證角色權限與 PG 參數 |
+| `sql/setup_roles.sql` | 在 PostgreSQL 建立 `cqp` 庫、`app_rw`、`app_ro` 與權限（可重複執行） |
+| `requirements.txt`、`requirements-dev.txt` | Python 依賴（全部以 `==` 鎖定版本；dev 另含 pytest、httpx） |
+| `pytest.ini` | pytest 設定 |
+| `tools/withenv.py` | 讀 `.env` 設定 DSN 後執行指令（測試、工具用） |
+| `tools/verify_db.py` | 驗證角色權限，列出 PG 參數 |
 | `tools/gen_data.py` | 合成資料產生器 |
 | `tools/fixtures.py`、`tools/check_fixtures_copy.py` | AC7 邊界 CSV 與其 COPY 層核對 |
 | `bench/ac1_ac2.py`、`bench/JdbcBench.java` | AC1／AC2 匯入匯出速度比較 |
 
-## 啟動
+## 啟動步驟
 
-```bash
-python tools/make_local_env.py                       # 或自行複製 env/mac.env.example → env/mac.env
-# 只啟動 db（本機開發／測試）
-docker compose --profile bundled-db -f docker/docker-compose.yml -f docker/docker-compose.dev.yml --env-file env/local.env up -d db
-# 全部（使用專案自帶 DB，Mac / Windows）
-docker compose --profile bundled-db -f docker/docker-compose.yml --env-file env/mac.env up -d --build
-# 全部（使用既有 PostgreSQL server）
-docker compose -f docker/docker-compose.yml --env-file env/external.env up -d --build
+1. 安裝 PostgreSQL **16 以上**（開發與正式建議 17），依下方「PostgreSQL 設定」調整參數與連線權限。
+2. 以超級使用者建立資料庫與角色（過程中會提示輸入 `app_rw`、`app_ro` 的密碼）：
+   ```sh
+   psql -h 127.0.0.1 -U postgres -d postgres -f sql/setup_roles.sql
+   ```
+3. 複製 `.env.example` 為 `.env`，填入 `CQP_DSN_RW`、`CQP_DSN_RO`（密碼中的特殊字元須 percent-encode，例如 `@` → `%40`；`$` 也要編成 `%24`，否則 Compose 會把它當變數展開）。`.env` 的變數會整份傳進 app 容器。
+4. 準備離線套件 `wheels/`（見下方「離線安裝套件」）。
+5. 啟動（repo 根目錄）：
+   ```sh
+   docker compose up -d --build
+   ```
+6. 確認容器連得到 DB：
+   ```sh
+   docker compose exec app python -c "import os, psycopg; psycopg.connect(os.environ['CQP_DSN_RO']).close(); print('ok')"
+   ```
+   瀏覽 `https://<CQP_HOST>`。
+
+- app 容器啟動時先以 `CQP_DSN_RW` 執行 `alembic upgrade head`，建立／更新平台中繼資料表。
+- 連線池上限預設每個 app worker 合計 20 條（查詢 12、匯出 4、匯入 2、系統 2）；`CQP_WORKERS=2` 時，DB 最多可能看到 40 條 app 連線。`max_connections` 請預留此容量，或調低 `CQP_POOL_QUERY`、`CQP_POOL_EXPORT`、`CQP_POOL_IMPORT`、`CQP_POOL_SYSTEM`。
+- 對外只有 proxy 的 443；app 不對外開 port。使用者連線網址必須與 `CQP_HOST` 一致（Caddy 以它簽發內部憑證）。
+
+## PostgreSQL 設定
+
+### 參數（postgresql.conf）
+
+原本由 compose 帶入的參數，改為在 `postgresql.conf`（或 `ALTER SYSTEM SET ...`）設定，改完重啟服務。
+
+| 參數 | Windows 正式主機（SPEC 3.3） | Mac 測試 | 說明 |
+|---|---|---|---|
+| `shared_buffers` | 6GB | 1GB | 需重啟 |
+| `effective_cache_size` | 16GB | 3GB | |
+| `work_mem` | 64MB | 32MB | PG15+ `hash_mem_multiplier` 預設 2.0，hash 節點可用 2×work_mem |
+| `maintenance_work_mem` | 2GB | 512MB | |
+| `max_parallel_workers_per_gather` | 2 | 2 | |
+| `max_wal_size` | 16GB | 4GB | |
+| `max_connections` | 50 | 50 | 需重啟；見上方連線池說明 |
+| `hash_mem_multiplier` | 2.0 | 2.0 | 明寫，避免預設值變動 |
+
+- Windows 正式值的前提是 DB 可用約 20GB 記憶體（SPEC 3.3）。DB 直接裝在 Windows 主機上時不再受 WSL2 記憶體上限影響，但要扣除 Docker（app、proxy）與其他程式的用量，依實際 RAM 調整。
+- `tools/verify_db.py` 會列出這些參數的實際值。
+
+### 讓 Docker 容器連得到 DB
+
+容器內的 `localhost` 是容器自己；DB 在同一台主機時，`.env` 的主機名稱用 `host.docker.internal`。DB 端需要：
+
+1. **`listen_addresses`**：預設 `localhost` 可能收不到容器的連線。**[待實測]** Docker Desktop（Mac／Windows）轉送到主機時，DB 看到的來源位址可能是 127.0.0.1，也可能是 Docker 的虛擬網段；先用預設值測試，連不上再改成主機的實際 IP 或 `'*'`。改成 `'*'` 時務必搭配下面的 `pg_hba.conf` 限制與作業系統防火牆，不要讓區網其他機器直接連 5432。
+2. **`pg_hba.conf`**：只允許平台帳號、`cqp` 庫、`scram-sha-256` 驗證。先開 `log_connections = on`，從 PostgreSQL log 看實際來源位址，再把規則收斂到該位址：
+   ```
+   # TYPE  DATABASE  USER           ADDRESS         METHOD
+   host    cqp       app_rw,app_ro  127.0.0.1/32    scram-sha-256
+   # 主機上跑 pytest 時（測試庫，見「開發與測試」）
+   host    cqp_test  app_rw,app_ro  127.0.0.1/32    scram-sha-256
+   # 若 log 顯示來源為 Docker 網段（例如 172.17.0.0/16 或 192.168.65.0/24），把實際網段加在這裡
+   ```
+   修改後 `SELECT pg_reload_conf();` 即可生效（`listen_addresses` 需重啟）。
+3. **Windows 防火牆**：`listen_addresses` 改成非 localhost 時，入站規則只開放給需要的來源。
+4. 用「啟動步驟」第 6 步確認連線。
+
+## 離線安裝套件
+
+### Docker image 用的 wheels（Linux）
+
+容器是 Linux，`wheels/` 必須放 Linux 版的 wheel，Python 版本要與 Dockerfile 一致（3.13）。
+
+**請在與 image 相同的 Linux 環境裡下載**：`requirements.txt` 有平台條件（例如 `uvloop ... ; sys_platform != 'win32'`），`pip download` 依「執行 pip 的那台機器」判斷這些條件，即使加 `--platform` 也一樣。在 Windows 上直接下載會漏掉 `uvloop`，Docker build 就會因 `--no-index` 找不到而失敗。在有網路、裝了 Docker 的電腦，於 repo 根目錄執行：
+
+```sh
+# 與 image 同架構（Windows／Intel 主機為 amd64；Apple Silicon Mac 為 arm64，Docker 會自動用本機架構）
+docker run --rm -v "${PWD}:/w" -w /w python:3.13-slim pip download -r requirements.txt -d wheels
+# 要給「另一種架構」的主機用時，加上 --platform，例如在 Apple Silicon Mac 準備 Windows 主機用的 wheels：
+docker run --rm --platform linux/amd64 -v "${PWD}:/w" -w /w python:3.13-slim pip download -r requirements.txt -d wheels
 ```
 
-- 預設部署不啟動專案自帶 DB。`CQP_DSN_RW`、`CQP_DSN_RO` 必須指向同一個既有資料庫；查詢／匯出以唯讀帳號連線，匯入／系統操作以讀寫帳號連線。URI 密碼中的特殊字元須 percent-encode。若 DB 和 app 在同一台主機的 Docker Desktop，通常以 `host.docker.internal` 作為 DB 主機名稱。
-- 連線池上限預設每個 app worker 合計 20 條（查詢 12、匯出 4、匯入 2、系統 2）；`CQP_WORKERS=2` 時，DB 最多可能看到 40 條 app 連線。實際連線採用時才建立，但設定既有 server 的連線上限時，請預留此容量，或調低 `CQP_POOL_QUERY`、`CQP_POOL_EXPORT`、`CQP_POOL_IMPORT`、`CQP_POOL_SYSTEM`。
-- 專案自帶 DB 僅供本機／PoC；需明確啟用 `--profile bundled-db`。本機開發連線為 `postgresql://app_rw:<密碼>@127.0.0.1:55432/cqp`、`postgresql://app_ro:<密碼>@127.0.0.1:55432/cqp`，密碼見 `env/local.env`。
-- 既有 PostgreSQL 必須為 **16 以上**。容器啟動命令會先以 `CQP_DSN_RW` 執行 `alembic upgrade head`，建立／更新平台中繼資料表；資料庫須預先建立，讀寫帳號需有 `public` schema 的建立物件權限。
-- 建議使用專用資料庫 `cqp` 與專用角色，不要沿用超級使用者。以 DBA 身分先建立角色和資料庫（替換密碼；`CREATE DATABASE` 請單獨執行）：
+- Windows 的 cmd 請把 `${PWD}` 換成 `%cd%`；PowerShell 用 `${PWD}` 即可。
+- 把整個 `wheels/` 資料夾放到 repo 根目錄（已被 .gitignore 排除，但會進 Docker build context）。
+- Dockerfile 以 BuildKit bind mount 掛在 `/tmp/wheels` 執行 `pip install --no-cache-dir --no-index --find-links=/tmp/wheels -r requirements.txt`，wheel 不會留在 image 內。缺任何一個 wheel 會直接失敗，不會連網補抓。需要 BuildKit（Docker Desktop 與 Docker Engine 23 以上預設啟用）。
+- 改了 `requirements.txt` 後，要重新下載 wheels。
 
-  ```sql
-  CREATE ROLE app_rw LOGIN PASSWORD '請換成強密碼';
-  CREATE ROLE app_ro LOGIN PASSWORD '請換成強密碼';
-  ALTER ROLE app_ro SET default_transaction_read_only = on;
-  CREATE DATABASE cqp OWNER app_rw;
-  ```
+### 其他離線前提
 
-  連到 `cqp` 資料庫後再設定 schema 與未來資料表的讀取權限：
+- **Docker base image**：`python:3.13-slim`、`node:22.14.0-slim`、`caddy:2` 需事先取得。離線主機可在有網路的電腦 `docker pull` 後 `docker save -o images.tar <image...>`，再到離線主機 `docker load -i images.tar`。
+- **前端 build**：Dockerfile 的 `npm ci` 目前需要連網（下載 npm 套件）。完全離線時需另行處理（例如預先 build `web/dist`）。
 
-  ```sql
-  ALTER SCHEMA public OWNER TO app_rw;
-  REVOKE ALL ON SCHEMA public FROM PUBLIC;
-  GRANT USAGE, CREATE ON SCHEMA public TO app_rw;
-  GRANT USAGE ON SCHEMA public TO app_ro;
-  ALTER DEFAULT PRIVILEGES FOR ROLE app_rw IN SCHEMA public
-    GRANT SELECT ON TABLES TO app_ro;
-  ```
+## 開發與測試（主機上，不經 Docker）
 
-- 若要使用內建 DB，將 `env/mac.env.example` 複製為 `env/mac.env` 並填入密碼，再加上 `--profile bundled-db`；未啟用 profile 時，Compose 不啟動 DB 容器。
-- 對外只有 proxy 的 443；db、app 不對外開 port。使用者連線網址必須與 `CQP_HOST` 一致（Caddy 以它簽發內部憑證）。
-- initdb 只在 **資料目錄為空**（第一次建立 volume）時執行。改了 `initdb/` 或密碼，需 `docker compose ... down -v` 重建（會清掉資料）。
-- `10-roles.sh` 必須有執行權限（`chmod +x`），且在 Windows 要用 LF 換行；否則容器內會報 `bad interpreter`（實測：缺執行權限時初始化失敗、角色未建立）。建議在 repo 根目錄加 `.gitattributes`：`*.sh text eol=lf`。
+**pytest 必須使用獨立的測試庫，不可指向平台庫 `cqp`**：測試會在該庫執行 `alembic upgrade head`、建立／刪除資料表、清空中繼資料表，並呼叫 `importer.recover()`（會把未完成的匯入工作重設或標為失敗）。
 
-## 權限設計（initdb）
+```sh
+psql -h 127.0.0.1 -U postgres -d postgres -v dbname=cqp_test -f sql/setup_roles.sql   # 建測試庫（角色與平台共用）
+python -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt          # Windows：.venv\Scripts\pip
+.venv/bin/python tools/withenv.py -- .venv/bin/python -m pytest -q
+.venv/bin/python tools/withenv.py -- .venv/bin/python tools/verify_db.py
+```
 
-- `app_rw`：`cqp` 庫與 `public` schema 的 owner，可建表。`app_ro`：只有 `USAGE` on schema 與 `SELECT`。
+- `.env` 填 `CQP_TEST_DSN`、`CQP_TEST_DSN_RO`（指向 `cqp_test`）。沒填時資料庫整合測試會被略過（不是失敗）；填成與平台 DSN 同一個庫時，`tools/withenv.py` 會拒絕執行。
+- `tools/withenv.py` 以 python-dotenv 讀 `.env`（與 Compose 相同規則）。DSN 優先順序：shell 已設定的 `CQP_DSN_*` → `.env` 的 `CQP_HOST_DSN_*` → `.env` 的 `CQP_DSN_*`。主機上通常無法解析 `host.docker.internal`，請在 `.env` 另填 `CQP_HOST_DSN_RW`、`CQP_HOST_DSN_RO`（例如 `127.0.0.1`）。
+- `tools/verify_db.py`、`tools/check_fixtures_copy.py`、`bench/ac1_ac2.py` 會在 `CQP_DSN_*` 指向的庫建立再刪除測試表（`verify_t`、`fx_t`、`bench_policy`）；建議同樣以 shell 指定測試庫執行，例如 `CQP_DSN_RW=<cqp_test 的 DSN> CQP_DSN_RO=<...> .venv/bin/python tools/withenv.py -- ...`。
+- 主機離線安裝同樣可用 `pip install --no-index --find-links=<目錄> -r requirements-dev.txt`，但 wheel 要用 `pip download` 在**同作業系統、同 Python 版本**下載（不加 `--platform`）。
+
+## 權限設計（sql/setup_roles.sql）
+
+- `app_rw`：`cqp` 庫與 `public` schema 的 owner，可建表。用於匯入、刪除、欄位維護、alembic 與系統工作。
+- `app_ro`：只有 `USAGE` on schema 與 `SELECT`。用於查詢與匯出（SPEC 9.5、11：查詢一律走唯讀角色）。查詢 SQL 由使用者在畫面上的條件、計算欄位、join 組出，平台又沒有登入；以唯讀角色執行，即使 SQL 組裝有 bug 或被注入，資料庫權限也會擋下任何修改。
 - `ALTER DEFAULT PRIVILEGES FOR ROLE app_rw IN SCHEMA public GRANT SELECT ON TABLES TO app_ro`：app_rw 日後建的表，app_ro 自動可讀（PG15+ public schema 預設不給 CREATE，這裡明確交給 app_rw）。
 - `app_ro` 另設 `default_transaction_read_only = on`，但這只是預設值（連線後可 `SET` 關掉），真正的防線是權限；`tools/verify_db.py` 兩者都驗證。
 - 注意：default privileges 只對「之後」建立的表生效；若 owner 不是 app_rw（例如以 postgres 建表），app_ro 讀不到。
+- 兩個 DSN 技術上可以填同一個帳號，但會失去上述保護，不建議。
 
 ## Caddy 寫入 allowlist
 
@@ -92,7 +157,7 @@ docker compose -f docker/docker-compose.yml --env-file env/external.env up -d --
 ## Bench（AC1／AC2）
 
 ```bash
-.venv/bin/python bench/ac1_ac2.py --rows 20000
+.venv/bin/python tools/withenv.py -- .venv/bin/python bench/ac1_ac2.py --rows 20000
 ```
 
-偏差說明：psql 經 `docker exec` 在容器內執行（每次含固定啟動成本，腳本另量基線並輸出「扣基線」欄），且走容器內 loopback；psycopg／JDBC 在主機經 Docker Desktop 的 port 轉送。要驗收 AC1 的「≤10%」，需把比較雙方放在同一網路位置、使用 GB 級檔案。JDBC 使用 `~/.m2` 內既有的 pgjdbc jar 以 `java` 單檔原始碼啟動（本機沒有 mvn），找不到 jar 或 java 時自動跳過。
+需主機上有 `psql`。psql、psycopg、JDBC 都在主機上經同一條網路路徑連 `CQP_DSN_RW` 指向的 DB；psql 每次呼叫含行程啟動與連線成本，腳本另量基線並輸出「扣基線」欄。要驗收 AC1 的「≤10%」需使用 GB 級檔案。JDBC 使用 `~/.m2` 內既有的 pgjdbc jar 以 `java` 單檔原始碼啟動，找不到 jar 或 java 時自動跳過。

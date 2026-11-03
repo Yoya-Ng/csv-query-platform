@@ -1,39 +1,27 @@
-"""驗證 initdb 的角色與權限（需先 up -d db，使用 env/local.env 與 127.0.0.1:55432）。
+"""驗證 sql/setup_roles.sql 設定的角色與權限，並列出 PostgreSQL 主要參數。
 
-斷言：app_rw 能建表寫入；app_ro 能 SELECT、不能 INSERT/CREATE，且自動能讀 app_rw 新建的表；
-      PostgreSQL 參數已由 env 帶入。
-用法：.venv/bin/python tools/verify_db.py [--env env/local.env] [--port 55432]
+斷言：app_rw 能建表寫入；app_ro 能 SELECT、不能 INSERT/CREATE，且自動能讀 app_rw 新建的表。
+連線取自環境變數 CQP_DSN_RW／CQP_DSN_RO（由 tools/withenv.py 從 .env 帶入）。
+用法：python tools/withenv.py -- python tools/verify_db.py
 """
 from __future__ import annotations
 
-import argparse
-from pathlib import Path
+import os
 
 import psycopg
 from psycopg import errors
 
-ROOT = Path(__file__).resolve().parent.parent
 
-
-def load_env(p: Path) -> dict[str, str]:
-    d = {}
-    for line in p.read_text(encoding="utf-8").splitlines():
-        if line.strip() and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            d[k.strip()] = v.strip()
-    return d
+def require_dsn(kind: str) -> str:
+    dsn = os.environ.get(f"CQP_DSN_{kind}")
+    if not dsn:
+        raise SystemExit(f"未設定 CQP_DSN_{kind}；請用 python tools/withenv.py -- ... 執行")
+    return dsn
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--env", default=str(ROOT / "env" / "local.env"))
-    ap.add_argument("--port", type=int, default=55432)
-    a = ap.parse_args()
-    env = load_env(Path(a.env))
-    rw = psycopg.connect(host="127.0.0.1", port=a.port, dbname="cqp", user="app_rw",
-                         password=env["CQP_RW_PASSWORD"], autocommit=True)
-    ro = psycopg.connect(host="127.0.0.1", port=a.port, dbname="cqp", user="app_ro",
-                         password=env["CQP_RO_PASSWORD"], autocommit=True)
+    rw = psycopg.connect(require_dsn("RW"), autocommit=True)
+    ro = psycopg.connect(require_dsn("RO"), autocommit=True)
     rw.execute("DROP TABLE IF EXISTS verify_t")
     rw.execute("CREATE TABLE verify_t (a int)")
     rw.execute("INSERT INTO verify_t VALUES (1)")

@@ -1,6 +1,7 @@
 // AC1/AC2 的 JDBC 量測輔助程式（由 bench/ac1_ac2.py 以 `java -cp <pgjdbc.jar> bench/JdbcBench.java ...` 呼叫）。
 // 單檔原始碼啟動（JDK 11+），不需 Maven。僅供 PoC 測速，CSV 解析只支援合成資料（無引號欄位）。
-// 用法：JdbcBench <jdbcUrl> <user> <password> <mode> <table> <file> <repeats>
+// 用法：JdbcBench <jdbcUrl> <user> - <mode> <table> <file> <repeats>
+// 密碼由環境變數 PGPASSWORD 帶入（第 3 個參數固定填 -），不放在命令列，避免出現在行程清單。
 //   mode = copy_in | batch_in | copy_out
 // 每次執行輸出一行 "RUN <秒數>"；copy_in/batch_in 每次前先 TRUNCATE（不計時）。
 import java.io.*;
@@ -11,7 +12,8 @@ import org.postgresql.copy.CopyManager;
 
 public class JdbcBench {
     public static void main(String[] a) throws Exception {
-        String url = a[0], user = a[1], pw = a[2], mode = a[3], table = a[4], file = a[5];
+        String url = a[0], user = a[1], mode = a[3], table = a[4], file = a[5];
+        String pw = System.getenv("PGPASSWORD");   // null：交給 pgjdbc 依 .pgpass 等方式處理
         int repeats = Integer.parseInt(a[6]);
         try (Connection c = DriverManager.getConnection(url, user, pw)) {
             CopyManager cm = c.unwrap(PGConnection.class).getCopyAPI();

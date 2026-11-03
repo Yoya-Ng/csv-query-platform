@@ -5,13 +5,16 @@
 
 ## 1. 執行方式
 
+PostgreSQL 自行安裝（不在 Docker 內），詳細步驟見 [infra.md](infra.md)。
+
 ```sh
-uv sync
-python3 tools/make_local_env.py              # 產生 env/local.env（隨機密碼，已被 .gitignore 排除）
-docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml --env-file env/local.env up -d db
-uv run python tools/withenv.py -- uv run pytest -q     # 含資料庫整合測試
-# 完整服務（Caddy HTTPS → app → db）：
-docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml --env-file env/local.env up -d --build
+psql -h 127.0.0.1 -U postgres -d postgres -f sql/setup_roles.sql   # 建 cqp 庫與 app_rw／app_ro（提示輸入密碼）
+psql -h 127.0.0.1 -U postgres -d postgres -v dbname=cqp_test -f sql/setup_roles.sql   # pytest 專用測試庫
+cp .env.example .env                                                 # 填入 CQP_DSN_RW／CQP_DSN_RO、CQP_TEST_DSN／CQP_TEST_DSN_RO
+python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python tools/withenv.py -- .venv/bin/python -m pytest -q   # 含資料庫整合測試（只連 cqp_test）
+# 完整服務（Caddy HTTPS → app → 外部 PostgreSQL）；需先準備 wheels/（infra.md「離線安裝套件」）
+docker compose up -d --build
 ```
 
 app 容器啟動時先執行 `alembic upgrade head` 建立中繼資料表。

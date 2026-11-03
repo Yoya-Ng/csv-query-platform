@@ -1,43 +1,42 @@
 """AC1（匯入速度）／AC2（匯出速度）：同一檔案各跑 N 次（預設 3）取中位數，以 MB/s 輸出比較表。
 
 比較項目
-  匯入：psql \\copy（檔案已在容器內 / 以 stdin 管線送入）、psycopg 3 cursor.copy() 串流（8MB 區塊）、
+  匯入：psql \\copy（本機檔案 / 以 stdin 管線送入）、psycopg 3 cursor.copy() 串流（8MB 區塊）、
         JDBC CopyManager、JDBC batch insert（reWriteBatchedInserts）
-  匯出：psql \\copy 到容器內檔案 / 到 stdout 管線、psycopg 3 迭代 copy、psycopg 3 copy.read()、JDBC copyOut
+  匯出：psql \\copy 到本機檔案 / 到 stdout 管線、psycopg 3 迭代 copy、psycopg 3 copy.read()、JDBC copyOut
 
 量測偏差（務必看）
-  - psql 在容器內以 `docker exec` 執行：每次呼叫含 exec 啟動與 psql 連線建立成本（固定 ~0.1–0.3 秒），
-    對小檔影響很大、對 GB 級檔案可忽略；本腳本另量「docker exec psql -c 'select 1'」基線，
-    並同時輸出「扣除基線」的 psql 數字。
-  - psql 與 DB 同在容器內（loopback，不經 Docker Desktop 的 port forward），psycopg/JDBC 在主機經 127.0.0.1:55432
-    （Docker Desktop 的網路層），兩者網路路徑不同。stdin 管線方式則 psql 的輸入也要經 docker exec 的 stdio 轉送。
-  - 所以 AC1 的「差距 ≤ 10%」在正式驗收時，應把 psycopg 也放進同一容器（或兩邊都在主機）再比。
+  - psql 每次呼叫含行程啟動與連線建立成本，對小檔影響很大、對 GB 級檔案可忽略；本腳本另量
+    「psql -c 'select 1'」基線，並同時輸出「扣除基線」的 psql 數字。
+  - psql、psycopg、JDBC 都在執行本腳本的主機上，經同一條網路路徑連 CQP_DSN_RW 指向的 DB。
   - 2 萬筆結果只證明腳本可用，不代表 AC 驗收。
 
-用法
-  .venv/bin/python bench/ac1_ac2.py --rows 20000 [--repeats 3] [--env env/local.env] [--container cqp-db-1]
+用法（需主機上有 psql）
+  python tools/withenv.py -- python bench/ac1_ac2.py --rows 20000 [--repeats 3]
 壓測表為 bench_policy，結束（含失敗）一定 DROP。
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote, urlencode
 
 import psycopg
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 import gen_data  # noqa: E402
-from verify_db import load_env  # noqa: E402
+from verify_db import require_dsn  # noqa: E402
 
 TABLE = "bench_policy"
 BLOCK = 8 * 1024 * 1024
-PORT = 55432
 
 
 def ddl(defn: dict) -> str:
@@ -60,6 +59,21 @@ def med_runs(fn, repeats: int, before=None) -> list[float]:
     return out
 
 
+def build_jdbc_url(params: dict) -> str | None:
+    """由 libpq 連線參數組 pgjdbc URL，保留 sslmode；多主機與 Unix socket 無法對應時回 None。"""
+    host = str(params.get("host") or "127.0.0.1")
+    port = str(params.get("port") or "5432")
+    if host.startswith("/") or "," in host or "," in port:
+        return None
+    if ":" in host:                                   # IPv6 位址要加中括號
+        host = f"[{host}]"
+    url = f"jdbc:postgresql://{host}:{port}/{quote(str(params.get('dbname') or 'cqp'), safe='')}"
+    q = {"reWriteBatchedInserts": "true"}
+    if params.get("sslmode"):
+        q["sslmode"] = str(params["sslmode"])
+    return f"{url}?{urlencode(q)}"
+
+
 def find_jdbc_jar() -> Path | None:
     base = Path.home() / ".m2/repository/org/postgresql/postgresql"
     if not base.exists():
@@ -72,14 +86,13 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, default=20000)
     ap.add_argument("--repeats", type=int, default=3)
-    ap.add_argument("--env", default=str(ROOT / "env" / "local.env"))
-    ap.add_argument("--container", default="cqp-db-1")
     ap.add_argument("--workdir", type=Path, default=ROOT / "data" / "bench")
     ap.add_argument("--skip-jdbc", action="store_true")
     a = ap.parse_args()
 
-    env = load_env(Path(a.env))
-    pw = env["CQP_RW_PASSWORD"]
+    dsn = require_dsn("RW")
+    params = conninfo_to_dict(dsn)
+    pw = params.pop("password", None) or ""
     a.workdir.mkdir(parents=True, exist_ok=True)
     src = a.workdir / f"bench_{a.rows}.csv"
     defn = gen_data.build_policy_def(200, TABLE)
@@ -88,9 +101,16 @@ def main() -> int:
     mb = size / 1e6
     print(f"測試檔：{src.name}，{a.rows} 列 × 200 欄，{mb:.1f} MB；每項 {a.repeats} 次取中位數", file=sys.stderr)
 
-    conn = psycopg.connect(host="127.0.0.1", port=PORT, dbname="cqp", user="app_rw", password=pw, autocommit=True)
-    dexec = ["docker", "exec", "-e", f"PGPASSWORD={pw}", a.container]
-    psql = ["psql", "-h", "127.0.0.1", "-U", "app_rw", "-d", "cqp", "-X", "-q", "-v", "ON_ERROR_STOP=1"]
+    conn = psycopg.connect(dsn, autocommit=True)
+    # 密碼走 PGPASSWORD，不放進命令列參數（避免出現在行程清單）；DSN 沒有密碼時沿用使用者原本的設定（.pgpass 等）
+    penv = dict(os.environ)
+    if pw:
+        penv["PGPASSWORD"] = pw
+    # 選項放在連線字串前面：舊版 Windows psql 的 getopt 不會重排參數
+    psql = ["psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", make_conninfo(**params)]
+
+    def run_psql(extra: list[str], **kw):
+        return subprocess.run(psql + extra, env=penv, check=True, **kw)
     results: dict[str, list[float]] = {}
     notes: dict[str, str] = {}
 
@@ -104,26 +124,22 @@ def main() -> int:
         conn.execute(f"DROP TABLE IF EXISTS {TABLE}")
         conn.execute(ddl(defn))
 
-        # ---- 基線：docker exec + psql 啟動成本
-        base = med_runs(lambda: subprocess.run(dexec + psql + ["-c", "select 1"], check=True, capture_output=True),
-                        a.repeats)
+        # ---- 基線：psql 啟動與連線成本
+        base = med_runs(lambda: run_psql(["-c", "select 1"], capture_output=True), a.repeats)
         base_med = statistics.median(base)
-        print(f"基線 docker exec psql 啟動成本（中位數）：{base_med:.3f}s", file=sys.stderr)
+        print(f"基線 psql 啟動成本（中位數）：{base_med:.3f}s", file=sys.stderr)
 
-        # ---- 匯入
-        subprocess.run(["docker", "cp", str(src), f"{a.container}:/tmp/bench_in.csv"], check=True, capture_output=True)
+        # ---- 匯入（\copy 的檔名用 psql 字面量引號；單引號加倍）
+        src_lit = src.resolve().as_posix().replace("'", "''")
 
         def psql_file_in():
-            subprocess.run(dexec + psql + ["-c", f"\\copy {TABLE} from '/tmp/bench_in.csv' csv header null ''"],
-                           check=True, capture_output=True)
-        results["匯入 psql \\copy（容器內檔案）"] = med_runs(psql_file_in, a.repeats, trunc)
+            run_psql(["-c", f"\\copy {TABLE} from '{src_lit}' csv header null ''"], capture_output=True)
+        results["匯入 psql \\copy（本機檔案）"] = med_runs(psql_file_in, a.repeats, trunc)
         assert count() == a.rows, count()
 
         def psql_stdin_in():
             with open(src, "rb") as f:
-                subprocess.run(["docker", "exec", "-i", "-e", f"PGPASSWORD={pw}", a.container] + psql +
-                               ["-c", f"\\copy {TABLE} from pstdin csv header null ''"],
-                               stdin=f, check=True, capture_output=True)
+                run_psql(["-c", f"\\copy {TABLE} from pstdin csv header null ''"], stdin=f, capture_output=True)
         results["匯入 psql \\copy（stdin 管線）"] = med_runs(psql_stdin_in, a.repeats, trunc)
         assert count() == a.rows, count()
 
@@ -136,9 +152,12 @@ def main() -> int:
         assert count() == a.rows, count()
 
         jar = None if a.skip_jdbc else find_jdbc_jar()
+        jdbc_url = build_jdbc_url(params)
         jdbc_ok = False
         if a.skip_jdbc:
             notes["JDBC"] = "已用 --skip-jdbc 跳過"
+        elif jdbc_url is None:
+            notes["JDBC"] = "DSN 為多主機或 Unix socket，JDBC URL 無法對應，跳過"
         elif subprocess.run(["java", "-version"], capture_output=True).returncode != 0:
             notes["JDBC"] = "本機無 java，跳過"
         elif jar is None:
@@ -148,9 +167,11 @@ def main() -> int:
             notes["JDBC"] = f"java + {jar.name}（單檔原始碼啟動 bench/JdbcBench.java，未用 mvn）"
 
         def jdbc(mode: str, f: Path) -> list[float]:
-            url = f"jdbc:postgresql://127.0.0.1:{PORT}/cqp?reWriteBatchedInserts=true"
-            r = subprocess.run(["java", "-cp", str(jar), str(ROOT / "bench" / "JdbcBench.java"), url, "app_rw", pw,
-                                mode, TABLE, str(f), str(a.repeats)], check=True, capture_output=True, text=True)
+            # 密碼經 penv 的 PGPASSWORD 帶入，第 3 個參數固定 "-"
+            r = subprocess.run(["java", "-cp", str(jar), str(ROOT / "bench" / "JdbcBench.java"), jdbc_url,
+                                params.get("user", "app_rw"), "-",
+                                mode, TABLE, str(f), str(a.repeats)], env=penv, check=True, capture_output=True,
+                               text=True)
             return [float(x.split()[1]) for x in r.stdout.splitlines() if x.startswith("RUN")]
 
         if jdbc_ok:
@@ -164,17 +185,17 @@ def main() -> int:
         psycopg_in()
         assert count() == a.rows
 
+        out_file_lit = (a.workdir / "out_psql_file.csv").resolve().as_posix().replace("'", "''")
+
         def psql_file_out():
-            subprocess.run(dexec + psql + ["-c", f"\\copy (select * from {TABLE}) to '/tmp/bench_out.csv' csv header"],
-                           check=True, capture_output=True)
-        results["匯出 psql \\copy（容器內檔案）"] = med_runs(psql_file_out, a.repeats)
+            run_psql(["-c", f"\\copy (select * from {TABLE}) to '{out_file_lit}' csv header"], capture_output=True)
+        results["匯出 psql \\copy（本機檔案）"] = med_runs(psql_file_out, a.repeats)
 
         outp = a.workdir / "out_psql.csv"
 
         def psql_stdout_out():
             with open(outp, "wb") as f:
-                subprocess.run(dexec + psql + ["-c", f"\\copy (select * from {TABLE}) to pstdout csv header"],
-                               stdout=f, check=True)
+                run_psql(["-c", f"\\copy (select * from {TABLE}) to pstdout csv header"], stdout=f)
         results["匯出 psql \\copy（stdout 管線）"] = med_runs(psql_stdout_out, a.repeats)
         out_size = outp.stat().st_size
 
@@ -208,7 +229,7 @@ def main() -> int:
             adj = f"{sz / max(m - base_med, 1e-9):>13.1f}" if "psql" in k else f"{'-':>13}"
             print(f"{k:<{44 - sum(1 for ch in k if ord(ch) > 0x2e80)}}{m:>10.3f}{sz / m:>9.1f}{adj}   "
                   f"{', '.join(f'{x:.3f}' for x in v)}")
-        print(f"\n基線（docker exec psql select 1，中位數）：{base_med:.3f}s")
+        print(f"\n基線（psql select 1，中位數）：{base_med:.3f}s")
         for k, v in notes.items():
             print(f"{k}：{v}")
         print(json.dumps({k: statistics.median(v) for k, v in results.items()}, ensure_ascii=False), file=sys.stderr)
@@ -217,8 +238,6 @@ def main() -> int:
             conn.execute(f"DROP TABLE IF EXISTS {TABLE}")
         finally:
             conn.close()
-            subprocess.run(["docker", "exec", a.container, "sh", "-c", "rm -f /tmp/bench_in.csv /tmp/bench_out.csv"],
-                           capture_output=True)
     return 0
 
 

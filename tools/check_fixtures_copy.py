@@ -1,6 +1,6 @@
 """把 fixtures 直接用 COPY（FORMAT csv, HEADER true, NULL '', FORCE_NULL）餵進臨時表，核對 EXPECT 中屬於 COPY 層的預期。
 表頭驗證類（duplicate/unknown/missing）與 NUL 屬 App 層，這裡只確認 COPY 本身的行為。
-用法：.venv/bin/python tools/check_fixtures_copy.py   （需 db 容器在 127.0.0.1:55432 運作）
+用法：python tools/withenv.py -- python tools/check_fixtures_copy.py   （連線取自 .env 的 CQP_DSN_RW）
 """
 from __future__ import annotations
 
@@ -12,9 +12,7 @@ import psycopg
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fixtures  # noqa: E402
-from verify_db import load_env  # noqa: E402
-
-ROOT = Path(__file__).resolve().parent.parent
+from verify_db import require_dsn  # noqa: E402
 
 
 def load(cur, path: Path, cols: str) -> str | None:
@@ -32,9 +30,7 @@ def load(cur, path: Path, cols: str) -> str | None:
 
 
 def main() -> int:
-    env = load_env(ROOT / "env" / "local.env")
-    conn = psycopg.connect(host="127.0.0.1", port=55432, dbname="cqp", user="app_rw", password=env["CQP_RW_PASSWORD"],
-                           autocommit=True)
+    conn = psycopg.connect(require_dsn("RW"), autocommit=True)
     cur = conn.cursor()
     cur.execute("DROP TABLE IF EXISTS fx_t")
     cur.execute("CREATE TABLE fx_t (yyyymm integer NOT NULL, policy_no varchar(20) NOT NULL, note varchar(100), "

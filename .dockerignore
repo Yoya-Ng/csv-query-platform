@@ -4,7 +4,8 @@
 .pytest_cache
 **/__pycache__
 data
-env/*.env
+.env
+env
 bench
 tests
 web/node_modules
