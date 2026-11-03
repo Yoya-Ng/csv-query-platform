@@ -1,0 +1,89 @@
+# 大量 CSV 資料查詢平台 — docker-compose（SPEC 3.1）
+# 用法：docker compose -f docker/docker-compose.yml --env-file env/<mac|win>.env up -d --build
+# 參數與密碼全由 env 檔帶入；env/*.env 已被 .gitignore 排除。
+name: cqp
+
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    mem_limit: ${DB_MEM_LIMIT:?DB_MEM_LIMIT 未設定}
+    shm_size: ${DB_SHM_SIZE:-1g}
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未設定}
+      CQP_RW_PASSWORD: ${CQP_RW_PASSWORD:?CQP_RW_PASSWORD 未設定}
+      CQP_RO_PASSWORD: ${CQP_RO_PASSWORD:?CQP_RO_PASSWORD 未設定}
+    # SPEC 3.3 參數全部由 env 帶入；hash_mem_multiplier 明寫（PG15+ 預設即 2.0）
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:?}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:?}
+      - -c
+      - work_mem=${PG_WORK_MEM:?}
+      - -c
+      - maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:?}
+      - -c
+      - max_parallel_workers_per_gather=${PG_MAX_PARALLEL_WORKERS_PER_GATHER:?}
+      - -c
+      - max_wal_size=${PG_MAX_WAL_SIZE:?}
+      - -c
+      - max_connections=${PG_MAX_CONNECTIONS:?}
+      - -c
+      - hash_mem_multiplier=2.0
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    # 不對外開 port；只在 compose 內部網路以 db:5432 存取
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cqp"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      CQP_DSN_RW: postgresql://app_rw:${CQP_RW_PASSWORD}@db:5432/cqp
+      CQP_DSN_RO: postgresql://app_ro:${CQP_RO_PASSWORD}@db:5432/cqp
+      CQP_UPLOAD_DIR: /var/lib/cqp/uploads
+      CQP_ERROR_REPORT_DIR: /var/lib/cqp/errors
+      CQP_WORKERS: ${CQP_WORKERS:-2}
+    volumes:
+      - uploads:/var/lib/cqp/uploads
+      - errors:/var/lib/cqp/errors
+    # app port 不對外，只給 proxy 使用
+    expose:
+      - "8000"
+
+  proxy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - app
+    environment:
+      # 寫入類路徑的 IP allowlist（空白分隔的 CIDR，或 private_ranges）
+      CQP_WRITE_ALLOW: ${CQP_WRITE_ALLOW:-private_ranges}
+      # 使用者連線用的主機名或 IP（內部憑證的名稱；連線網址必須與它一致）
+      CQP_HOST: ${CQP_HOST:-localhost}
+    ports:
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  pgdata:
+  uploads:
+  errors:
+  caddy_data:
+  caddy_config:

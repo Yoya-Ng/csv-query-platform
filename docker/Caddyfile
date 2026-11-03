@@ -1,0 +1,28 @@
+# SPEC 2 / 3.1：tls internal；寫入類路徑用 IP allowlist；不設 trusted_proxies
+# 站台位址必須是具體主機名或 IP（CQP_HOST）：純 ":443" 沒有名稱可簽發內部憑證，TLS 握手會失敗（已實測）。
+{
+	# 客戶端不帶 SNI（直接用 IP 連線）時使用的憑證名稱
+	default_sni {$CQP_HOST:localhost}
+	auto_https disable_redirects
+}
+
+https://{$CQP_HOST:localhost} {
+	tls internal
+
+	# 寫入類操作（SPEC 11）：這些路徑前綴下所有非 GET/HEAD 請求（建資料集、欄位維護、上傳、匯入、
+	# 刪除確認、取消、重試、整期刪除）。路徑結尾的 * 為前綴比對，涵蓋多層子路徑。
+	# CQP_WRITE_ALLOW 預設 private_ranges，可填 CIDR 清單（空白分隔）
+	@write_denied {
+		path /api/upload* /api/datasets* /api/loads* /api/delete*
+		not method GET HEAD
+		not remote_ip {$CQP_WRITE_ALLOW:private_ranges}
+	}
+	respond @write_denied "forbidden" 403
+
+	reverse_proxy app:8000 {
+		# 由 Caddy 自行寫入來源 IP，不信任客戶端帶來的值（未設 trusted_proxies）
+		header_up X-Forwarded-For {remote_host}
+		# 大檔分塊上傳／匯出串流：不緩衝
+		flush_interval -1
+	}
+}

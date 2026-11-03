@@ -1,0 +1,7 @@
+# 本機開發／測試覆蓋檔：只把 db 綁在 127.0.0.1:55432（不對區網開放）
+# 只啟動 db：
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml --env-file env/local.env up -d db
+services:
+  db:
+    ports:
+      - "127.0.0.1:55432:5432"
