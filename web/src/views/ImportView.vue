@@ -102,6 +102,8 @@ const upProg = ref({ done: 0, total: 0 });
 const uploadError = ref("");
 const load = ref<Load | null>(null);
 const loadError = ref("");
+const loadErrorFatal = ref(false);   // true：4xx，已停止輪詢；false：暫時錯誤，仍在重試
+const queryError = ref("");          // 網址 ?load= 的問題（與輪詢錯誤分開）
 let abortCtl: AbortController | null = null;
 
 const confirmDlg = ref<HTMLDialogElement | null>(null);
@@ -173,17 +175,23 @@ async function poll(id: string, token: number) {
     if (token !== watchToken) return;
     load.value = l;
     loadError.value = "";
+    loadErrorFatal.value = false;
     if (isTerminal(l.status) || waitingForUser(l)) return;
   } catch (e) {
     if (token !== watchToken) return;
     loadError.value = errMsg(e);
-    // 4xx（工作不存在、ID 格式錯誤、權限）不會自行恢復，停止輪詢；網路錯誤與 5xx 才繼續
-    if (e instanceof ApiError && e.status >= 400 && e.status < 500 && e.status !== 429) return;
+    // 4xx（工作不存在、ID 格式錯誤、權限）不會自行恢復，停止輪詢；網路錯誤、5xx、408、429 才繼續
+    const fatal = e instanceof ApiError && e.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429;
+    loadErrorFatal.value = fatal;
+    if (fatal) return;
   }
   timer = setTimeout(() => poll(id, token), 2000);
 }
 function watchLoad(id: string) {
   stopPolling();
+  if (load.value?.load_id !== id) load.value = null;   // 換工作時不沿用上一個工作的資料
+  loadError.value = "";
+  loadErrorFatal.value = false;
   stage.value = "watching";
   const token = watchToken;
   poll(id, token);
@@ -196,13 +204,21 @@ onMounted(async () => {
   } catch (e) {
     formError.value = errMsg(e);
   }
-  const q = route.query.load;
-  if (typeof q === "string" && UUID_RE.test(q)) watchLoad(q);
-  else if (q) loadError.value = "網址中的匯入工作編號格式不正確";
+  openLoadFromQuery(route.query.load);
 });
-watch(() => route.query.load, (q) => {
-  if (typeof q === "string" && UUID_RE.test(q)) watchLoad(q);
-});
+// 網址 ?load=：合法 UUID 才輪詢；格式錯誤只顯示訊息（不呼叫 API、不輪詢，也不動目前畫面上的上傳或工作）
+function openLoadFromQuery(q: unknown) {
+  queryError.value = "";
+  if (!q) return;                       // 回到 /import：保留從表單建立、未寫入網址的工作
+  if (typeof q !== "string" || !UUID_RE.test(q)) {
+    queryError.value = "網址中的匯入工作編號格式不正確";
+  } else if (stage.value === "uploading" || stage.value === "creating") {
+    queryError.value = "上傳進行中，完成或中止後再開啟其他匯入工作";
+  } else {
+    watchLoad(q);
+  }
+}
+watch(() => route.query.load, openLoadFromQuery);
 onBeforeUnmount(() => {
   stopPolling();
   abortCtl?.abort();
@@ -258,6 +274,8 @@ function reset() {
   stage.value = "idle";
   uploadError.value = "";
   loadError.value = "";
+  loadErrorFatal.value = false;
+  queryError.value = "";
   actionMsg.value = "";
   file.value = null;
 }
@@ -317,6 +335,7 @@ watch(() => load.value?.load_id, () => { operator.value = ""; ack.value = false;
 <template>
   <div class="page stack">
     <h1>匯入</h1>
+    <div v-if="queryError" class="notice error">{{ queryError }}</div>
 
     <!-- 設定 -->
     <section v-if="stage === 'idle' && !load" class="card stack">
@@ -407,7 +426,7 @@ watch(() => load.value?.load_id, () => { operator.value = ""; ack.value = false;
         <h2 class="grow" style="margin: 0">匯入工作</h2>
         <span v-if="load" class="badge" :class="badgeClass(load.status)">{{ STATUS_LABEL[load.status] }}（{{ load.status }}）</span>
       </div>
-      <div v-if="loadError" class="notice warn">{{ loadError }}</div>
+      <div v-if="loadError" class="notice" :class="loadErrorFatal ? 'error' : 'warn'">{{ loadError }}</div>
       <template v-if="load">
         <div class="small muted" style="overflow-wrap: anywhere">
           {{ MODE_LABEL[load.mode] ?? load.mode }}　期別 {{ load.yyyymm }}　檔案 {{ load.filename ?? "—" }}<br />

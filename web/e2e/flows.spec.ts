@@ -227,6 +227,8 @@ test("匯入：網址帶錯誤的工作編號 → 顯示錯誤、不輪詢", asy
   page.on("request", (r) => { if (r.url().includes("/api/loads/")) loadCalls++; });
   await page.goto("/#/import?load=not-a-uuid");
   await expect(page.locator("main")).toContainText("工作編號格式不正確");
+  await page.goto("/#/import");                          // 網址不再帶 load → 訊息清除
+  await expect(page.locator("main")).not.toContainText("工作編號格式不正確");
   await page.goto("/#/import?load=00000000-0000-0000-0000-000000000000");
   await expect(page.locator(".notice.error").first()).toContainText("load_id 不存在");
   await page.waitForTimeout(4500);                       // 輪詢間隔 2 秒：若仍在輪詢會有 ≥3 次
