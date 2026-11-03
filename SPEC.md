@@ -67,7 +67,7 @@ PostgreSQL 17（app_rw 寫入角色 / app_ro 唯讀查詢角色；自行安裝�
 | `proxy` | Caddy，對區網提供 HTTPS；`trusted_proxies` 為空 |
 
 - 連線資訊放 repo 根目錄 `.env`（Compose 自動讀取），`.gitignore` 與 `.dockerignore` 排除；範本 `.env.example`。
-- Python 依賴以 `requirements.txt`（`==` 鎖版本）管理，Docker image 以 `pip install --no-index --find-links` 從 `wheels/` 離線安裝。
+- Python 依賴以 `requirements.txt`（`==` 鎖版本）管理，Docker image 以 `pip install --no-index --find-links` 從 `wheels/` 離線安裝；前端以 `npm ci --offline` 從 `npm-cache/` 離線安裝。
 - 最低 PostgreSQL 版本：15（`HEADER MATCH`、`MERGE` 等）；開發與正式皆用 17。
 
 ### 3.2 Windows 主機

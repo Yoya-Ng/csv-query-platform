@@ -13,7 +13,7 @@ psql -h 127.0.0.1 -U postgres -d postgres -v dbname=cqp_test -f sql/setup_roles.
 cp .env.example .env                                                 # 填入 CQP_DSN_RW／CQP_DSN_RO、CQP_TEST_DSN／CQP_TEST_DSN_RO
 python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python tools/withenv.py -- .venv/bin/python -m pytest -q   # 含資料庫整合測試（只連 cqp_test）
-# 完整服務（Caddy HTTPS → app → 外部 PostgreSQL）；需先準備 wheels/（infra.md「離線安裝套件」）
+# 完整服務（Caddy HTTPS → app → 外部 PostgreSQL）；需先準備 wheels/ 與 npm-cache/（infra.md「離線安裝套件」）
 docker compose up -d --build
 ```
 

@@ -8,7 +8,7 @@ PostgreSQL 不放在 Docker 內：自行安裝 PostgreSQL server（本機或其�
 |---|---|
 | `docker-compose.yml` | `app`、`proxy`（Caddy）；自動讀取同目錄的 `.env` |
 | `.env.example` | 連線設定範本（複製為 `.env`；`.env` 已被 .gitignore 與 .dockerignore 排除） |
-| `docker/Dockerfile` | 前端 `npm ci && npm run build`；後端 python:3.13-slim，`pip install --no-index --find-links` 離線安裝；非 root 執行 |
+| `docker/Dockerfile` | 前端 `npm ci --offline`（從 `npm-cache/` 離線安裝）後 `npm run build`；後端 python:3.13-slim，`pip install --no-index --find-links` 離線安裝；非 root 執行 |
 | `docker/Caddyfile` | `tls internal`、寫入類路徑 IP allowlist、`header_up X-Forwarded-For {remote_host}` |
 | `sql/setup_roles.sql` | 在 PostgreSQL 建立 `cqp` 庫、`app_rw`、`app_ro` 與權限（可重複執行） |
 | `requirements.txt`、`requirements-dev.txt` | Python 依賴（全部以 `==` 鎖定版本；dev 另含 pytest、httpx） |
@@ -27,7 +27,7 @@ PostgreSQL 不放在 Docker 內：自行安裝 PostgreSQL server（本機或其�
    psql -h 127.0.0.1 -U postgres -d postgres -f sql/setup_roles.sql
    ```
 3. 複製 `.env.example` 為 `.env`，填入 `CQP_DSN_RW`、`CQP_DSN_RO`（密碼中的特殊字元須 percent-encode，例如 `@` → `%40`；`$` 也要編成 `%24`，否則 Compose 會把它當變數展開）。`.env` 的變數會整份傳進 app 容器。
-4. 準備離線套件 `wheels/`（見下方「離線安裝套件」）。
+4. 準備離線套件 `wheels/` 與 `npm-cache/`（見下方「離線安裝套件」）。
 5. 啟動（repo 根目錄）：
    ```sh
    docker compose up -d --build
@@ -99,10 +99,33 @@ docker run --rm --platform linux/amd64 -v "${PWD}:/w" -w /w python:3.13-slim pip
 - Dockerfile 以 BuildKit bind mount 掛在 `/tmp/wheels` 執行 `pip install --no-cache-dir --no-index --find-links=/tmp/wheels -r requirements.txt`，wheel 不會留在 image 內。缺任何一個 wheel 會直接失敗，不會連網補抓。需要 BuildKit（Docker Desktop 與 Docker Engine 23 以上預設啟用）。
 - 改了 `requirements.txt` 後，要重新下載 wheels。
 
+### 前端 build 用的 npm-cache（Linux）
+
+前端依賴含平台專屬的原生套件（`@rolldown/binding-*`、`lightningcss-*`），npm 只會下載「執行 npm 的那台機器」需要的版本。在 Mac／Windows 上直接準備的快取沒有 Linux 版，Docker build 會失敗；**請在與 image 相同的 Linux 環境與架構裡準備**。在有網路、裝了 Docker 的電腦，於 repo 根目錄執行：
+
+```sh
+# macOS／Linux／PowerShell；與 image 同架構（Docker 會自動用本機架構）
+docker run --rm -v "${PWD}/web:/src:ro" -v "${PWD}/npm-cache:/cache" node:22.14.0-slim sh -c 'cp /src/package.json /src/package-lock.json /tmp/ && cd /tmp && npm ci --ignore-scripts --no-audit --no-fund --cache /cache'
+# 要給「另一種架構」的主機用時，加上 --platform，例如在 Apple Silicon Mac 準備 Windows／Intel 主機用的快取：
+docker run --rm --platform linux/amd64 -v "${PWD}/web:/src:ro" -v "${PWD}/npm-cache:/cache" node:22.14.0-slim sh -c 'cp /src/package.json /src/package-lock.json /tmp/ && cd /tmp && npm ci --ignore-scripts --no-audit --no-fund --cache /cache'
+```
+
+Windows cmd 不認單引號，`&&` 會被 cmd 拆走、一部分跑在主機上；請改用下面這行（`%cd%` 取代 `${PWD}`，`sh -c` 參數用雙引號）：
+
+```bat
+docker run --rm -v "%cd%\web:/src:ro" -v "%cd%\npm-cache:/cache" node:22.14.0-slim sh -c "cp /src/package.json /src/package-lock.json /tmp/ && cd /tmp && npm ci --ignore-scripts --no-audit --no-fund --cache /cache"
+```
+
+- **架構要對上離線主機**：Windows／Intel 主機是 amd64，Apple Silicon Mac 是 arm64。不確定時兩種都準備（快取以內容雜湊存放，對同一個 `npm-cache/` 先後執行兩行，兩種架構的原生套件都會留在裡面）。
+- 只把 `web/` 以唯讀掛進容器、加 `--ignore-scripts`：準備快取只需要下載 tarball，不執行第三方套件的 install script，也不讓容器改寫主機上的 repo。先把 `package*.json` 複製到容器內的 `/tmp` 再安裝，Linux 版 `node_modules` 不會寫進主機的 `web/node_modules`（開發用）。
+- 把整個 `npm-cache/` 資料夾放到 repo 根目錄（已被 .gitignore 排除，但會進 Docker build context）。
+- Dockerfile 以 BuildKit bind mount 掛在 `/tmp/npm-cache` 執行 `npm ci --offline --cache /tmp/npm-cache`，快取不會留在 image 內。缺任何一個套件會以 `ENOTCACHED` 失敗，不會連網補抓；npm 也會用 `package-lock.json` 的 integrity（sha512）驗證每個套件。沒有 `npm-cache/` 時 build 會以 `"/npm-cache": not found` 失敗，照本節準備即可。
+- 改了 `web/package-lock.json` 後要重新準備：先把舊的 `npm-cache/` 移走（移到垃圾桶或改名），再執行上面的指令。快取只增不減，不清掉的話舊版 tarball 會一直留著，build context 越來越大。
+- 驗證 npm 確實不連網：`docker build --network=none --target web -f docker/Dockerfile .`。`--network=none` 只限制 `RUN` 步驟的網路，base image 的解析仍走主機，所以 `node:22.14.0-slim` 需已在本機；完整的離線驗證仍以離線主機實際執行 `docker compose up -d --build` 為準。
+
 ### 其他離線前提
 
 - **Docker base image**：`python:3.13-slim`、`node:22.14.0-slim`、`caddy:2` 需事先取得。離線主機可在有網路的電腦 `docker pull` 後 `docker save -o images.tar <image...>`，再到離線主機 `docker load -i images.tar`。
-- **前端 build**：Dockerfile 的 `npm ci` 目前需要連網（下載 npm 套件）。完全離線時需另行處理（例如預先 build `web/dist`）。
 
 ## 開發與測試（主機上，不經 Docker）
 
