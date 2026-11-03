@@ -5,32 +5,34 @@ name: cqp
 
 services:
   db:
+    # 專案自帶的 PostgreSQL 僅供本機／PoC 使用；正式或既有 DB 部署不啟用此 profile。
+    profiles: [bundled-db]
     image: postgres:17
     restart: unless-stopped
-    mem_limit: ${DB_MEM_LIMIT:?DB_MEM_LIMIT 未設定}
+    mem_limit: ${DB_MEM_LIMIT:-5g}
     shm_size: ${DB_SHM_SIZE:-1g}
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未設定}
-      CQP_RW_PASSWORD: ${CQP_RW_PASSWORD:?CQP_RW_PASSWORD 未設定}
-      CQP_RO_PASSWORD: ${CQP_RO_PASSWORD:?CQP_RO_PASSWORD 未設定}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      CQP_RW_PASSWORD: ${CQP_RW_PASSWORD:-}
+      CQP_RO_PASSWORD: ${CQP_RO_PASSWORD:-}
     # SPEC 3.3 參數全部由 env 帶入；hash_mem_multiplier 明寫（PG15+ 預設即 2.0）
     command:
       - postgres
       - -c
-      - shared_buffers=${PG_SHARED_BUFFERS:?}
+      - shared_buffers=${PG_SHARED_BUFFERS:-1GB}
       - -c
-      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:?}
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-3GB}
       - -c
-      - work_mem=${PG_WORK_MEM:?}
+      - work_mem=${PG_WORK_MEM:-32MB}
       - -c
-      - maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:?}
+      - maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-512MB}
       - -c
-      - max_parallel_workers_per_gather=${PG_MAX_PARALLEL_WORKERS_PER_GATHER:?}
+      - max_parallel_workers_per_gather=${PG_MAX_PARALLEL_WORKERS_PER_GATHER:-2}
       - -c
-      - max_wal_size=${PG_MAX_WAL_SIZE:?}
+      - max_wal_size=${PG_MAX_WAL_SIZE:-4GB}
       - -c
-      - max_connections=${PG_MAX_CONNECTIONS:?}
+      - max_connections=${PG_MAX_CONNECTIONS:-50}
       - -c
       - hash_mem_multiplier=2.0
     volumes:
@@ -48,12 +50,10 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
     environment:
-      CQP_DSN_RW: postgresql://app_rw:${CQP_RW_PASSWORD}@db:5432/cqp
-      CQP_DSN_RO: postgresql://app_ro:${CQP_RO_PASSWORD}@db:5432/cqp
+      # DSN 可以指向既有 PostgreSQL；URI 中的特殊字元須 percent-encode。
+      CQP_DSN_RW: ${CQP_DSN_RW:?請設定 CQP_DSN_RW}
+      CQP_DSN_RO: ${CQP_DSN_RO:?請設定 CQP_DSN_RO}
       CQP_UPLOAD_DIR: /var/lib/cqp/uploads
       CQP_ERROR_REPORT_DIR: /var/lib/cqp/errors
       CQP_WORKERS: ${CQP_WORKERS:-2}
