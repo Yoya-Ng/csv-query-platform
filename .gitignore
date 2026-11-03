@@ -2,6 +2,7 @@
 .env
 env/
 wheels/
+npm-cache/
 .playwright-mcp/
 __pycache__/
 *.pyc

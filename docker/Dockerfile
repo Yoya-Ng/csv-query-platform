@@ -2,7 +2,11 @@
 FROM node:22.14.0-slim AS web
 WORKDIR /web
 COPY web/package.json web/package-lock.json ./
-RUN npm ci --no-audit --no-fund
+# 離線安裝：npm-cache/（repo 根目錄，需事先在同架構 Linux 容器準備，見 docs/infra.md）
+# 以 BuildKit bind mount 掛在 /tmp/npm-cache；--offline：只用快取，缺套件直接 ENOTCACHED，不會連網補抓。
+# rw：npm 會寫入快取的 index／_logs，寫入只在這一步有效，不會留在 image 或回寫主機。
+RUN --mount=type=bind,source=npm-cache,target=/tmp/npm-cache,rw \
+    npm ci --offline --no-audit --no-fund --cache /tmp/npm-cache
 COPY web/ ./
 RUN npm run build
 

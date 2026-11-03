@@ -3,7 +3,7 @@
 #
 # 用法（repo 根目錄）：
 #   1. 複製 .env.example 為 .env，填入 CQP_DSN_RW／CQP_DSN_RO
-#   2. 準備 wheels/（離線安裝 Python 套件，見 docs/infra.md）
+#   2. 準備 wheels/ 與 npm-cache/（離線安裝 Python 與前端套件，見 docs/infra.md）
 #   3. docker compose up -d --build
 #
 # Compose 會自動讀取同目錄的 .env；.env 已被 .gitignore 與 .dockerignore 排除。
