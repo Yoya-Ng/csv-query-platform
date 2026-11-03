@@ -75,7 +75,7 @@ def put_chunk(conn, s: Settings, upload_id: str, seq: int, data: bytes) -> dict:
     if hashlib.sha256(data).hexdigest() != sess["chunk_sha256"].split(",")[seq]:
         raise UploadError(f"區塊 {seq} SHA-256 不符，請重傳")
     p = _dir(s, upload_id) / "chunks" / f"{seq:06d}"
-    tmp = p.with_suffix(".tmp")
+    tmp = p.with_name(f"{p.name}.{uuid.uuid4().hex}.tmp")   # 同區塊並發重送時各自寫自己的暫存檔
     tmp.write_bytes(data)
     os.replace(tmp, p)       # 寫暫存檔 + rename
     return {"received": seq, "missing": missing(s, upload_id, n)}
@@ -85,6 +85,16 @@ def missing(s: Settings, upload_id: str, n: int) -> list[int]:
     d = _dir(s, upload_id) / "chunks"
     have = {int(p.name) for p in d.iterdir() if p.name.isdigit()}
     return [i for i in range(n) if i not in have]
+
+
+def status(conn, s: Settings, upload_id: str) -> dict:
+    """續傳用：回傳狀態與尚缺的區塊序號（只有 OPEN 才有意義）。"""
+    _dir(s, upload_id)                      # 先驗證格式，再查資料庫
+    sess = _get(conn, upload_id)
+    miss = missing(s, upload_id, sess["total_chunks"]) if sess["status"] == "OPEN" else []
+    return {"upload_id": upload_id, "status": sess["status"], "missing": miss,
+            "total_chunks": sess["total_chunks"], "total_bytes": sess["total_bytes"],
+            "chunk_sha256": [h for h in sess["chunk_sha256"].split(",") if h]}
 
 
 def complete(conn, s: Settings, upload_id: str) -> dict:

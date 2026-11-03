@@ -463,6 +463,19 @@ class PostgresAdapter(Adapter):
             (tag,)).fetchall()
         return any(r[0] for r in rows)
 
+    def list_periods(self, conn, ds: DatasetDef) -> list[tuple[int, int]]:
+        """已掛上父表的期別與估計筆數（reltuples，未 ANALYZE 為 -1 → 0）。期別取自分割界限，不依賴表名。"""
+        rows = conn.execute(
+            """SELECT pg_get_expr(c.relpartbound, c.oid), GREATEST(c.reltuples, 0)::bigint
+                 FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+                WHERE i.inhparent = to_regclass(%s)""", (ds.table_name,)).fetchall()
+        out = []
+        for bound, est in rows:
+            m = re.fullmatch(r"FOR VALUES IN \((\d{6})\)", bound or "")
+            if m:
+                out.append((int(m.group(1)), int(est)))
+        return sorted(out, reverse=True)
+
     def estimate_rows(self, conn, ds: DatasetDef) -> int:
         """父表所有分割的 reltuples 合計（ANALYZE 後的估計值；-1 代表未分析，視為 0）。"""
         return int(conn.execute(

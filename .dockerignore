@@ -7,3 +7,7 @@ data
 env/*.env
 bench
 tests
+web/node_modules
+web/dist
+web/test-results
+web/e2e
