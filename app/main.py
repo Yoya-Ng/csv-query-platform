@@ -3,13 +3,18 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlsplit
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Body, FastAPI, HTTPException, Request, Response
+from fastapi import Body, FastAPI, Form, HTTPException, Request, Response
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import insert, select
 
 from app.catalog import CatalogError, ColumnDef
@@ -17,7 +22,7 @@ from app.config import get_settings
 from app.db import catalog_repo
 from app.db.adapters.base import AdapterError, LockBusy
 from app.db.adapters.postgres import get_adapter
-from app.db.meta import load_log, saved_query
+from app.db.meta import load_log, meta_dataset, saved_query
 from app.db.pool import close_all, get_pool
 from app.db.sqlexec import execute
 from app.services import importer, jobs, upload
@@ -46,6 +51,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="CSV 查詢平台", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def same_origin_writes(request: Request, call_next):
+    if request.method not in ("GET", "HEAD", "OPTIONS") and request.url.path.startswith("/api/") \
+            and cross_site(request):
+        return JSONResponse({"error": "只接受本站頁面送出的請求（跨站請求已拒絕）"}, status_code=403)
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -109,7 +122,8 @@ def health():
 @app.get("/api/datasets")
 def list_datasets():
     with _sys() as c:
-        return [{"name": d.name, "schema_version": d.schema_version, "description": d.description,
+        return [{"dataset_id": d.dataset_id, "name": d.name, "schema_version": d.schema_version,
+                 "description": d.description,
                  "columns": len(d.active_columns)} for d in catalog_repo.load_all(c).values()]
 
 
@@ -130,6 +144,13 @@ def create_dataset(request: Request, body: dict = Body(...), operator_note: str 
     ds = catalog_repo.dataset_from_json(body)
     with _sys() as c:
         return _ds_json(catalog_repo.create_dataset(c, adapter, ds, note=operator_note, ip=client_ip(request)))
+
+
+@app.get("/api/datasets/{name}/periods")
+def list_periods(name: str):
+    with _sys() as c:
+        ds = catalog_repo.load_dataset(c, name)
+        return [{"yyyymm": p, "rows_estimate": n} for p, n in adapter.list_periods(c, ds)]
 
 
 class NewColumn(BaseModel):
@@ -188,6 +209,12 @@ async def upload_chunk(upload_id: str, seq: int, request: Request):
     return await run_in_threadpool(put)
 
 
+@app.get("/api/upload/{upload_id}")
+def upload_status(upload_id: str):
+    with _sys() as c:
+        return upload.status(c, get_settings(), upload_id)
+
+
 @app.post("/api/upload/{upload_id}/complete")
 def upload_complete(upload_id: str):
     with _sys() as c:
@@ -213,10 +240,16 @@ def create_load(body: NewLoad, request: Request):
     return {"load_id": lid}
 
 
+def _dataset_names(c) -> dict[int, str]:
+    return {r[0]: r[1] for r in execute(c, select(meta_dataset.c.dataset_id, meta_dataset.c.name)).fetchall()}
+
+
 @app.get("/api/loads/{load_id}")
 def get_load(load_id: str):
     with _sys() as c:
-        return _ser(importer.get_load(c, load_id))
+        ld = importer.get_load(c, load_id)
+        ld["dataset_name"] = _dataset_names(c).get(ld["dataset_id"])
+        return _ser(ld)
 
 
 @app.get("/api/loads")
@@ -225,7 +258,9 @@ def list_loads(dataset: str | None = None, limit: int = 50):
         q = select(load_log).order_by(load_log.c.created_at.desc()).limit(min(limit, 500))
         if dataset:
             q = q.where(load_log.c.dataset_id == catalog_repo.load_dataset(c, dataset).dataset_id)
-        return [_ser(dict(r._mapping)) for r in execute(c, q).fetchall()]
+        names = _dataset_names(c)
+        return [_ser(dict(r._mapping) | {"dataset_name": names.get(r._mapping["dataset_id"])})
+                for r in execute(c, q).fetchall()]
 
 
 @app.get("/api/loads/{load_id}/errors")
@@ -322,9 +357,36 @@ class ExportReq(QueryReq):
 def query_export(q: ExportReq, request: Request):
     gen = runner.export(q.spec, _catalog(), adapter, session_id=request.state.sid, client_ip=client_ip(request),
                         encoding=q.encoding, gzip=q.gzip, allow_many=q.allow_many_to_many)
-    name = "export.csv.gz" if q.gzip else "export.csv"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = str(q.spec.get("from", "export"))[:30] if isinstance(q.spec, dict) else "export"
+    name = f"{base}_{stamp}.csv" + (".gz" if q.gzip else "")
     return StreamingResponse(gen, media_type="application/gzip" if q.gzip else "text/csv",
                              headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+@app.post("/api/query/export-form")
+def query_export_form(request: Request, payload: str = Form(...)):
+    """瀏覽器以表單送出（target 為隱藏 iframe），由瀏覽器直接串流下載、不經 JS 記憶體。
+    錯誤時回 JSON（前端從 iframe 讀出顯示）。"""
+    try:
+        q = ExportReq.model_validate_json(payload)
+    except ValidationError as e:
+        return JSONResponse({"error": "匯出參數格式錯誤：" + "；".join(
+            f"{'.'.join(str(x) for x in err['loc'])} {err['msg']}" for err in e.errors()[:5])}, status_code=400)
+    return query_export(q, request)
+
+
+def cross_site(request: Request) -> bool:
+    """瀏覽器送出的跨站請求（CSRF）判斷。表單 POST 與只帶 query 參數的 POST 都是 simple request，
+    沒有 CORS preflight，任何網頁都能代使用者送出。瀏覽器一定會帶 Sec-Fetch-Site（現代瀏覽器）或 Origin；
+    兩者皆無代表非瀏覽器用戶端（curl、批次腳本），不受 CSRF 影響，放行。"""
+    site = request.headers.get("sec-fetch-site")
+    if site is not None:
+        return site not in ("same-origin", "none")
+    origin = request.headers.get("origin")
+    if origin is None or origin == "null":
+        return origin == "null"
+    return urlsplit(origin).netloc != request.headers.get("host", "")
 
 
 @app.post("/api/query/{job_id}/cancel")
@@ -351,6 +413,15 @@ def save_query(q: SavedQuery):
     return {"query_id": qid}
 
 
+@app.get("/api/saved-queries")
+def list_queries(limit: int = 200):
+    with _sys() as c:
+        rows = execute(c, select(saved_query.c.query_id, saved_query.c.name, saved_query.c.note,
+                                 saved_query.c.created_at)
+                       .order_by(saved_query.c.created_at.desc()).limit(min(limit, 500))).fetchall()
+    return [_ser(dict(r._mapping)) for r in rows]
+
+
 @app.get("/api/saved-queries/{query_id}")
 def load_query(query_id: int):
     with _sys() as c:
@@ -370,6 +441,12 @@ def load_query(query_id: int):
             "schema_versions": json.loads(r["schema_versions"])}
 
 
-@app.get("/")
-def root():
-    return Response("CSV 查詢平台 API（前端尚未實作，見 /docs）", media_type="text/plain; charset=utf-8")
+# 前端（web/dist）：放在所有 /api 路由之後，未比對到的路徑才交給靜態檔
+_WEB_DIST = Path(os.environ.get("CQP_WEB_DIST", Path(__file__).resolve().parents[1] / "web" / "dist"))
+if (_WEB_DIST / "index.html").exists():
+    app.mount("/", StaticFiles(directory=_WEB_DIST, html=True), name="web")
+else:
+    @app.get("/")
+    def root():
+        return Response("CSV 查詢平台 API（前端尚未 build：cd web && npm run build）",
+                        media_type="text/plain; charset=utf-8")

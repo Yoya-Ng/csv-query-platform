@@ -111,6 +111,17 @@ def _prepare(spec, catalog, adapter, allow_many) -> tuple[CompiledQuery, list[st
     return cq, warnings, bool(bigs)
 
 
+def _stable_order(spec, catalog):
+    """預覽以 OFFSET 分頁：沒有 ORDER BY 時 PostgreSQL 不保證順序，頁與頁可能重複或遺漏。
+    使用者沒指定排序時，以主表主鍵排序（只用於預覽，不改變匯出與儲存的規格）。"""
+    if not isinstance(spec, dict) or spec.get("order") or spec.get("from") not in catalog:
+        return spec
+    ds = catalog[spec["from"]]
+    if not ds.pk_columns:
+        return spec
+    return {**spec, "order": [[f"{ds.name}.{c.code}", "asc", "nulls_last"] for c in ds.pk_columns]}
+
+
 def _query_slots(s: Settings, session_id: str, client_ip: str, is_big: bool):
     """每 session 1、每 IP 3；只有用到大表的查詢才佔「大查詢」名額（併發 4，排隊最多 60 秒）。"""
     personal = [("session-query", session_id, 1), ("ip", client_ip, 3)]
@@ -122,6 +133,7 @@ def preview(spec: dict, catalog: dict[str, DatasetDef], adapter: Adapter, *, ses
             offset: int = 0, limit: int = 1000, allow_many: bool = False, job_id: str | None = None,
             settings: Settings | None = None) -> dict:
     s = settings or get_settings()
+    spec = _stable_order(spec, catalog)
     cq, warnings, is_big = _prepare(spec, catalog, adapter, allow_many)
     paginate(cq, offset, limit)                      # 檢查 offset / limit 範圍
     stmt = cq.select.offset(offset).limit(limit + 1)  # 多取 1 筆判斷 has_more
