@@ -16,6 +16,7 @@ PostgreSQL 不放在 Docker 內：自行安裝 PostgreSQL server（本機或其�
 | `tools/withenv.py` | 讀 `.env` 設定 DSN 後執行指令（測試、工具用） |
 | `tools/verify_db.py` | 驗證角色權限，列出 PG 參數 |
 | `tools/gen_data.py` | 合成資料產生器 |
+| `tools/def_from_csv.py` | 由真實 CSV 表頭與抽樣資料產生資料集定義 JSON 草稿 |
 | `tools/fixtures.py`、`tools/check_fixtures_copy.py` | AC7 邊界 CSV 與其 COPY 層核對 |
 | `bench/ac1_ac2.py`、`bench/JdbcBench.java` | AC1／AC2 匯入匯出速度比較 |
 
@@ -157,6 +158,22 @@ python -m venv .venv
 
 寫入類路徑（`/api/upload*`、`/api/datasets/*/columns*`、`/api/loads*`、`/api/delete*`）只允許 `CQP_WRITE_ALLOW`（預設 `private_ranges`，也可填空白分隔的 CIDR）來源；其餘來源回 403。不設 `trusted_proxies`，`X-Forwarded-For` 由 Caddy 以實際連線 IP 覆寫。
 注意：Docker Desktop（Mac／Windows）的 port 轉送可能讓 Caddy 看到的來源 IP 是 Docker 閘道 IP（私有網段），而不是真實用戶端 IP，allowlist 在這種部署下實際上形同全放行；Windows 正式環境需實測 `remote_host` 看到的是什麼（建議 PoC 時用 `docker logs` 檢查）。
+
+## 由真實 CSV 產生定義草稿
+
+```bash
+.venv/bin/python tools/def_from_csv.py data/d005_202610.csv --name d005 \
+  --rename 評價年月=yyyymm --rename 保單號碼=policy_no --pk policy_no --checksum premium_amt --out data/d005.json
+# 不用 CSV 的 yyyymm 當分割鍵：另建獨立分割鍵欄（不在 CSV，匯入時由畫面期別帶入）
+.venv/bin/python tools/def_from_csv.py data/x.csv.gz --name x --partition-key load_period --pk policy_no --out data/x.json
+```
+
+- 只讀表頭與前 `--sample-rows` 列（預設 100000，`0` 讀全檔），串流處理，記憶體只存每欄統計。讀檔規則同平台匯入：UTF-8（可帶 BOM）、逗號、可為 gzip；空欄視為缺失，`NA`、`N/A` 是一般字串。
+- 表頭轉成 code（小寫英數底線）；轉不出來的（例如中文）暫用 `col_001` 並在報告標示，用 `--rename 原表頭=code` 指定。原表頭與 code 不同時自動成為別名。
+- 型別推斷：`date`（僅 YYYY-MM-DD）→ `integer`／`bigint` → `numeric(p,s)`（整數部分多留 `--numeric-headroom` 位，預設 2）→ `varchar(n)`（10／20／50／100／255／500／1000／2000／4000 取最小可容納者）。整數部分有前導零（如代碼 `00123`）一律當文字。
+- 主鍵、驗算欄、必填欄不自動猜：`--pk`、`--checksum`、`--required` 指定；分割鍵自動放在主鍵第一個。
+- stdout 輸出逐欄報告（TSV），含需人工確認的項目；有無法上傳的問題（表頭空白或重複、含 `|`、指定欄位不存在、分割鍵或驗算欄型別不符）時列出全部問題、結束碼 2，不寫出 JSON。輸出檔已存在時需加 `--force`。
+- **只是草稿**：抽樣外的值可能超出推斷的長度或小數位（平台不四捨五入，會在驗證階段報「格式不符」），上傳前請確認。
 
 ## 合成資料
 
