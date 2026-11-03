@@ -1,4 +1,4 @@
-"""應用設定：一律由環境變數帶入（docker-compose env_file），不寫死密碼。"""
+"""應用設定：一律由環境變數帶入（docker-compose 由 .env 帶入），不寫死密碼。"""
 from functools import lru_cache
 from pathlib import Path
 

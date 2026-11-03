@@ -1,4 +1,4 @@
-# 大量 CSV 資料查詢平台 — 規格書 v0.8
+# 大量 CSV 資料查詢平台 — 規格書 v0.8.1
 
 - 狀態：規格定稿待 PoC（尚未實作、尚未實測）
 - 日期：2026-11-03
@@ -11,7 +11,7 @@
 
 | 問題 | 結論 |
 |---|---|
-| 整體架構 | PostgreSQL 17 + FastAPI（Python）+ Vue 3 + AG Grid + Caddy（HTTPS），docker-compose 部署。資料一律在 DB 內運算，Python 不整批載入記憶體 |
+| 整體架構 | PostgreSQL 17 + FastAPI（Python）+ Vue 3 + AG Grid + Caddy（HTTPS）；app、Caddy 以 docker-compose 部署，PostgreSQL 自行安裝（v0.8.1 起不在 Docker 內）。資料一律在 DB 內運算，Python 不整批載入記憶體 |
 | 取代 psql 的方法 | psycopg 3 `cursor.copy()`。**[事實]** 與 psql `\copy` 同為 `COPY ... FROM STDIN / TO STDOUT` 協定；**[推論]** 速度同級，PoC 實測。不用 pandas `to_sql`、逐筆 INSERT |
 | JDBC 會不會慢 | JDBC 本身不慢，看用法。pgjdbc `CopyManager` 走 COPY 協定（**[推論]** 與 psql 同級）；batch INSERT（`reWriteBatchedInserts=true`）較慢；**[事實]** pgjdbc 預設整個結果集載入記憶體，大量讀取需 `autoCommit=false` + `setFetchSize`。Python 經 JDBC（JayDeBeApi）不建議（**[推論]** JVM↔Python 逐值轉換） |
 | 欄位維護 | 中繼資料表 + 實體寬表；新增欄位走 `ALTER TABLE ADD COLUMN`；不用 EAV / JSONB 存主資料 |
@@ -54,7 +54,7 @@ FastAPI (uvicorn, 多 worker；app port 不對外)
    ├─ job runner       背景工作（匯入、切換、清理、備份），前端輪詢狀態
    └─ db/adapters/     postgres.py（v1）；greenplum.py、oracle.py（日後）
    │
-PostgreSQL 17（app_rw 寫入角色 / app_ro 唯讀查詢角色；named volume）
+PostgreSQL 17（app_rw 寫入角色 / app_ro 唯讀查詢角色；自行安裝於主機，不在 Docker 內）
 ```
 
 ## 3. 部署與環境
@@ -62,11 +62,12 @@ PostgreSQL 17（app_rw 寫入角色 / app_ro 唯讀查詢角色；named volume�
 ### 3.1 docker-compose
 | 服務 | 說明 |
 |---|---|
-| `db` | `postgres:17`（**[事實]** 官方映像支援 arm64 與 amd64），named volume `pgdata`，不對外開 port，設 `mem_limit` |
+| ~~`db`~~ | v0.8.1 移除：PostgreSQL 改為自行安裝（本機或其他主機），平台以 `CQP_DSN_RW`／`CQP_DSN_RO` 連線；參數改在 `postgresql.conf` 設定（值同 3.3），角色以 `sql/setup_roles.sql` 建立 |
 | `app` | FastAPI + uvicorn，`psycopg_pool` |
 | `proxy` | Caddy，對區網提供 HTTPS；`trusted_proxies` 為空 |
 
-- 密碼放 `.env`（`env_file` 帶入），`.gitignore` 排除；Mac / Windows 參數各一份（`env/mac.env`、`env/win.env`）。
+- 連線資訊放 repo 根目錄 `.env`（Compose 自動讀取），`.gitignore` 與 `.dockerignore` 排除；範本 `.env.example`。
+- Python 依賴以 `requirements.txt`（`==` 鎖版本）管理，Docker image 以 `pip install --no-index --find-links` 從 `wheels/` 離線安裝。
 - 最低 PostgreSQL 版本：15（`HEADER MATCH`、`MERGE` 等）；開發與正式皆用 17。
 
 ### 3.2 Windows 主機
@@ -77,10 +78,10 @@ PostgreSQL 17（app_rw 寫入角色 / app_ro 唯讀查詢角色；named volume�
   processors=8
   swap=8GB
   ```
-- PostgreSQL 資料放 named volume / WSL2 檔案系統，**不 bind mount `C:\`**（跨檔案系統 I/O 很慢）。
+- （v0.8.1）PostgreSQL 改為直接安裝在 Windows 主機，資料目錄放主機本機 NVMe，不經 WSL2。上方 `.wslconfig` 的 24GB 是為 DB 容器配置；DB 移出後 WSL2 只跑 app／proxy，應調低（**[推論]** 約 4～6GB，依壓測調整），否則與主機上的 PostgreSQL 搶記憶體（3.3 的 20GB 改為留給主機上的 PostgreSQL）。
 - Windows 防火牆開放 443；其他人用 `https://<主機名或 IP>` 連線，各電腦需匯入 Caddy 根憑證一次（或改用公司 CA）。
 
-### 3.3 PostgreSQL 初始參數（容器可用約 20GB；PoC 壓測後調整）
+### 3.3 PostgreSQL 初始參數（DB 可用約 20GB；PoC 壓測後調整）
 | 參數 | 值 | 說明 |
 |---|---|---|
 | `shared_buffers` | 6GB | |
@@ -91,7 +92,7 @@ PostgreSQL 17（app_rw 寫入角色 / app_ro 唯讀查詢角色；named volume�
 | `max_wal_size` | 16GB | |
 | `max_connections` | 50 | |
 
-記憶體檢查公式（只作檢查，不是上限保證）：`大查詢併發 × (1 + parallel workers) × 每查詢 hash/sort 節點數 × work_mem × hash_mem_multiplier + shared_buffers ≤ mem_limit`；以 PoC 20 人併發腳本觀察實際峰值。
+記憶體檢查公式（只作檢查，不是上限保證）：`大查詢併發 × (1 + parallel workers) × 每查詢 hash/sort 節點數 × work_mem × hash_mem_multiplier + shared_buffers ≤ DB 可用記憶體`；以 PoC 20 人併發腳本觀察實際峰值。
 
 ### 3.4 Mac 測試環境
 - 只驗證功能與相對速度；容量與查詢效能一律以 Windows 實測為準（**[推論]** 資料量超過記憶體後快取行為不同，無法線性外推）。
@@ -381,6 +382,7 @@ PostgreSQL 17（app_rw 寫入角色 / app_ro 唯讀查詢角色；named volume�
 | v0.6 | 可換資料庫產品：DB Adapter 與跨 DB 規則 |
 | v0.7 | Codex 第 1 輪：表頭對應、狀態機、ON CONFLICT、AST 白名單、容量峰值、刪除 CTE、資源保護等 |
 | v0.8 | Codex 第 2、3 輪：預建索引與 lock_timeout、兩層鎖、父表主鍵、取消 sentinel、crash 恢復、TOCTOU、備份獨佔鎖、驗收斷言理由 |
+| v0.8.1 | 部署變更（使用者決定，2026-11-03）：PostgreSQL 不再放 Docker，改連自行安裝的 server；Compose 只含 app、proxy；依賴改 requirements.txt＋pip 離線安裝，移除 uv |
 
 ## 附錄 B：Codex 審查摘要
 

@@ -1,0 +1,60 @@
+# 大量 CSV 資料查詢平台 — docker-compose
+# PostgreSQL 不在 Docker 內：連線到自行安裝的 PostgreSQL server（本機或其他主機）。
+#
+# 用法（repo 根目錄）：
+#   1. 複製 .env.example 為 .env，填入 CQP_DSN_RW／CQP_DSN_RO
+#   2. 準備 wheels/（離線安裝 Python 套件，見 docs/infra.md）
+#   3. docker compose up -d --build
+#
+# Compose 會自動讀取同目錄的 .env；.env 已被 .gitignore 與 .dockerignore 排除。
+name: cqp
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    # .env 的其他 CQP_* 設定（例如 CQP_POOL_QUERY 等連線池大小）也傳進容器；下方 environment 優先
+    env_file:
+      - .env
+    environment:
+      # 讀寫（匯入、刪除、欄位維護、alembic）與唯讀（查詢、匯出）分開，見 docs/infra.md「權限設計」
+      # DB 在同一台主機時，主機名稱用 host.docker.internal（容器內的 localhost 是容器自己）
+      CQP_DSN_RW: ${CQP_DSN_RW:?請在 .env 設定 CQP_DSN_RW}
+      CQP_DSN_RO: ${CQP_DSN_RO:?請在 .env 設定 CQP_DSN_RO}
+      CQP_UPLOAD_DIR: /var/lib/cqp/uploads
+      CQP_ERROR_REPORT_DIR: /var/lib/cqp/errors
+      CQP_WORKERS: ${CQP_WORKERS:-2}
+    extra_hosts:
+      # Docker Desktop 已內建 host.docker.internal；Linux 的 Docker Engine 需要這行才能解析
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - uploads:/var/lib/cqp/uploads
+      - errors:/var/lib/cqp/errors
+    # app port 不對外，只給 proxy 使用
+    expose:
+      - "8000"
+
+  proxy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - app
+    environment:
+      # 寫入類路徑的 IP allowlist（空白分隔的 CIDR，或 private_ranges）
+      CQP_WRITE_ALLOW: ${CQP_WRITE_ALLOW:-private_ranges}
+      # 使用者連線用的主機名或 IP（內部憑證的名稱；連線網址必須與它一致）
+      CQP_HOST: ${CQP_HOST:-localhost}
+    ports:
+      - "443:443"
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  uploads:
+  errors:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,35 @@
+# 執行期依賴（版本由原 uv.lock 轉出，含間接依賴，全部以 == 鎖定）
+# 線上安裝：pip install -r requirements.txt
+# 離線安裝：pip install --no-cache-dir --no-index --find-links=<wheels 目錄> -r requirements.txt
+# 準備 wheels 的方式見 docs/infra.md「離線安裝套件」
+alembic==1.20.1
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.16.0
+click==8.5.0
+colorama==0.4.6 ; sys_platform == 'win32'
+fastapi==0.162.0
+h11==0.16.0
+httptools==0.9.0
+idna==3.20
+mako==1.4.3
+markupsafe==3.0.4
+opentelemetry-api==1.45.2
+psycopg==3.3.6
+psycopg-binary==3.3.6 ; implementation_name != 'pypy'
+psycopg-pool==3.3.3
+pydantic==2.14.2
+pydantic-core==2.50.2
+pydantic-settings==2.16.2
+python-dotenv==1.2.4
+python-multipart==0.0.33
+pyyaml==6.0.3
+sqlalchemy==2.1.6
+starlette==1.10.0
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+tzdata==2026.6 ; sys_platform == 'win32'
+uvicorn==0.54.0
+uvloop==0.23.0 ; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'
+watchfiles==1.3.0
+websockets==17.4
